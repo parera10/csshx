@@ -5,6 +5,14 @@ miss the SSH banner / login prompt because the PTY reader had no
 clients to forward to. With the scrollback buffer, connecting *after*
 the PTY has emitted bytes should still deliver every byte to the new
 client right after AUTH succeeds.
+
+Two macOS-specific gotchas the fixtures handle:
+
+* ``short_socket_dir`` keeps the AF_UNIX path under macOS's 104-byte
+  ``sun_path`` limit (pytest's ``tmp_path`` does not).
+* ``harmless_pid`` ensures the Slave has a real PID — ``shutdown_slave``
+  calls ``os.kill(pid, SIGTERM)`` and ``os.kill(0, ...)`` would signal
+  the entire process group (i.e. pytest itself).
 """
 from __future__ import annotations
 
@@ -23,22 +31,22 @@ if not hasattr(asyncio, "start_unix_server"):  # pragma: no cover
 from csshx_latest.slave import Slave, run_slave_bridge, shutdown_slave
 
 
-def _make_slave(sock_path: str, pty_read_fd: int, *, token: str = "TOK") -> Slave:
+def _make_slave(sock_path: str, pty_read_fd: int, pid: int, *, token: str = "TOK") -> Slave:
     return Slave(
         index=1,
         host="h",
         sock_path=sock_path,
         token=token,
         pty_master=pty_read_fd,
-        pid=0,
+        pid=pid,
     )
 
 
-def test_late_client_receives_scrollback(tmp_path):
+def test_late_client_receives_scrollback(short_socket_dir, harmless_pid):
     """Bytes emitted before any client connected must be replayed on AUTH."""
-    sock_path = str(tmp_path / "slave.sock")
+    sock_path = os.path.join(short_socket_dir, "slave.sock")
     pty_r, pty_w = os.pipe()
-    slave = _make_slave(sock_path, pty_r)
+    slave = _make_slave(sock_path, pty_r, harmless_pid)
 
     async def go() -> bytes:
         # Bridge sets up server + pty_reader_task. After this returns, the
@@ -73,11 +81,11 @@ def test_late_client_receives_scrollback(tmp_path):
     assert b"login: " in received
 
 
-def test_scrollback_is_capped(tmp_path):
+def test_scrollback_is_capped(short_socket_dir, harmless_pid):
     """A flood of pre-connect output must not unbounded-grow the buffer."""
-    sock_path = str(tmp_path / "slave.sock")
+    sock_path = os.path.join(short_socket_dir, "slave.sock")
     pty_r, pty_w = os.pipe()
-    slave = _make_slave(sock_path, pty_r)
+    slave = _make_slave(sock_path, pty_r, harmless_pid)
     slave.scrollback_max = 1024  # tighten the cap for the test
 
     async def go() -> int:
@@ -99,11 +107,11 @@ def test_scrollback_is_capped(tmp_path):
     assert size > 0
 
 
-def test_wrong_token_is_rejected_and_does_not_get_scrollback(tmp_path):
+def test_wrong_token_is_rejected_and_does_not_get_scrollback(short_socket_dir, harmless_pid):
     """Failed AUTH must drop the connection without leaking scrollback."""
-    sock_path = str(tmp_path / "slave.sock")
+    sock_path = os.path.join(short_socket_dir, "slave.sock")
     pty_r, pty_w = os.pipe()
-    slave = _make_slave(sock_path, pty_r, token="REAL_TOKEN")
+    slave = _make_slave(sock_path, pty_r, harmless_pid, token="REAL_TOKEN")
 
     async def go() -> bytes:
         await run_slave_bridge(slave)

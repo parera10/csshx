@@ -45,9 +45,9 @@ def _start_unix_server(sock_path: str, on_accept) -> tuple[socket.socket, thread
     return srv, t
 
 
-def test_auth_rejection_returns_1_with_clear_stderr(tmp_path, capsys):
+def test_auth_rejection_returns_1_with_clear_stderr(short_socket_dir, capsys):
     """Server closes immediately after reading AUTH → client must exit 1."""
-    sock_path = str(tmp_path / "rejecting.sock")
+    sock_path = os.path.join(short_socket_dir, "rejecting.sock")
 
     def reject(conn: socket.socket) -> None:
         # Drain whatever AUTH bytes the client sends so its sendall completes,
@@ -70,9 +70,9 @@ def test_auth_rejection_returns_1_with_clear_stderr(tmp_path, capsys):
     assert "AUTH rejected" in err
 
 
-def test_clean_eof_after_data_returns_0(tmp_path, capsys):
+def test_clean_eof_after_data_returns_0(short_socket_dir, capsys):
     """Server sends some bytes then closes → client exits 0 (normal disconnect)."""
-    sock_path = str(tmp_path / "happy.sock")
+    sock_path = os.path.join(short_socket_dir, "happy.sock")
 
     def serve(conn: socket.socket) -> None:
         try:
@@ -102,9 +102,9 @@ def test_bad_argv_returns_2(capsys):
     assert "usage:" in capsys.readouterr().err
 
 
-def test_connect_failure_returns_1(tmp_path, capsys):
+def test_connect_failure_returns_1(short_socket_dir, capsys):
     """Connecting to a nonexistent socket prints an error and returns 1."""
-    sock_path = str(tmp_path / "does-not-exist.sock")
+    sock_path = os.path.join(short_socket_dir, "does-not-exist.sock")
     rc = attach.main(["attach", sock_path, "TOKEN"])
     err = capsys.readouterr().err
     assert rc == 1
