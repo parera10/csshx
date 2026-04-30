@@ -42,6 +42,7 @@ def main(argv: list[str]) -> int:
         tty.setraw(in_fd)
 
     watch_in = True
+    received_any = False
     try:
         while True:
             watches = [sock]
@@ -51,7 +52,16 @@ def main(argv: list[str]) -> int:
             if sock in r:
                 data = sock.recv(BUFSIZE)
                 if not data:
+                    if not received_any:
+                        sys.stderr.write(
+                            "csshx-latest: AUTH rejected — the master closed the "
+                            "socket before sending any data. Check that the token "
+                            "embedded in the attach command matches the one the "
+                            "master generated for this slave.\n"
+                        )
+                        return 1
                     return 0
+                received_any = True
                 os.write(out_fd, data)
             if watch_in and in_fd in r:
                 try:
