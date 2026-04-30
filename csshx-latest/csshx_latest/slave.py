@@ -5,7 +5,11 @@ that PTY through a UNIX domain socket gated by an AUTH token.
 
 Output direction (PTY -> socket) is one-way: bytes the SSH session
 emits are fanned out to every authenticated socket connection (the
-visible terminal block).
+visible terminal block). Bytes that arrive *before* the terminal block
+has connected are kept in a per-slave scrollback buffer and replayed to
+each new client immediately after AUTH succeeds — otherwise the SSH
+banner and login prompt would be silently dropped during the time it
+takes the launcher to spawn the visible block.
 
 Input direction (socket -> PTY) accepts bytes from the focused terminal
 block AND from the master's broadcaster, both serialized through a
@@ -46,6 +50,15 @@ class Slave:
     server: Optional[asyncio.AbstractServer] = field(default=None, repr=False)
     pty_reader_task: Optional[asyncio.Task] = field(default=None, repr=False)
     connected_writers: list[asyncio.StreamWriter] = field(default_factory=list, repr=False)
+    # Bytes the PTY has emitted so far. Replayed to each new client after AUTH
+    # so late-connecting terminal blocks see the full session (banner, prompt,
+    # whatever scrolled by while the launcher was spawning them).
+    scrollback: bytearray = field(default_factory=bytearray, repr=False)
+    scrollback_max: int = 65536
+    # Held during the brief window where we (a) extend scrollback + snapshot
+    # writers, or (b) replay scrollback + register a new writer. Ensures every
+    # byte the PTY emits reaches every client exactly once and in order.
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 async def spawn_slave(
@@ -113,7 +126,17 @@ async def run_slave_bridge(slave: Slave) -> None:
             except Exception:
                 pass
             return
-        slave.connected_writers.append(writer)
+        # Replay scrollback and register the writer atomically with respect to
+        # pty_to_sockets — no await between buffering scrollback and joining
+        # the writer list — so we can never duplicate or lose a chunk.
+        async with slave.state_lock:
+            if slave.scrollback:
+                writer.write(bytes(slave.scrollback))
+            slave.connected_writers.append(writer)
+        try:
+            await writer.drain()
+        except Exception:
+            pass
         try:
             while True:
                 data = await reader.read(4096)
@@ -146,9 +169,25 @@ async def run_slave_bridge(slave: Slave) -> None:
                 data = await reader.read(4096)
                 if not data:
                     break
-                for w in list(slave.connected_writers):
+                # Atomically: append to scrollback, snapshot current writers,
+                # buffer the chunk to each. No await inside this block — the
+                # writes go to in-memory asyncio buffers; drain() runs after.
+                async with slave.state_lock:
+                    slave.scrollback.extend(data)
+                    excess = len(slave.scrollback) - slave.scrollback_max
+                    if excess > 0:
+                        del slave.scrollback[:excess]
+                    writers = list(slave.connected_writers)
+                    for w in writers:
+                        try:
+                            w.write(data)
+                        except Exception:
+                            try:
+                                slave.connected_writers.remove(w)
+                            except ValueError:
+                                pass
+                for w in writers:
                     try:
-                        w.write(data)
                         await w.drain()
                     except Exception:
                         try:

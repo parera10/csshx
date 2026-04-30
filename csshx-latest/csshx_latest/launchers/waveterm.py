@@ -20,7 +20,10 @@ class WaveTermLauncher:
         self._counter = 0
 
     @staticmethod
-    def _run(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+    def _run(args: list[str], capture: bool = True) -> subprocess.CompletedProcess:
+        # capture=True by default so legacy wsh probes (setlayout/layout/tile,
+        # deleteblock, settitle) don't spam the user's terminal on modern wsh
+        # builds where those subcommands have been renamed or removed.
         return subprocess.run(args, check=False, capture_output=capture, text=True)
 
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
