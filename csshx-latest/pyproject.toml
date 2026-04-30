@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csshx-latest"
+version = "0.1.0"
+description = "Modern, terminal-agnostic cluster-SSH (csshX rewrite)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "csshx-latest contributors"}]
+keywords = ["ssh", "cluster", "csshx", "terminal", "broadcast"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+csshx-latest = "csshx_latest.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["csshx_latest*"]
