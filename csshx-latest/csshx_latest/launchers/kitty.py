@@ -5,6 +5,13 @@ equivalent ``--listen-on`` flag). The constructor surfaces a clear
 error if the kitty CLI isn't on PATH; runtime failures from
 ``kitty @ launch`` are reported with kitty's own stderr included so
 config issues are easy to diagnose.
+
+v1.0 used ``--type=window``, which opened a fresh OS window per host.
+With ten ssh targets that meant ten OS-level windows — useless. v1.1
+defaults to ``--type=tab`` so all blocks live as tabs of the user's
+current kitty OS window, exactly like every other launcher.
+``--keep-focus`` keeps the master TUI focused so the user can keep
+typing without juggling windows.
 """
 from __future__ import annotations
 
@@ -15,7 +22,7 @@ from csshx_latest.launcher import BlockHandle
 
 
 class KittyLauncher:
-    """Open each block as a new kitty window. Tile via ``goto-layout grid``."""
+    """Open each block as a new kitty tab. Tile via ``goto-layout grid``."""
 
     name = "kitty"
 
@@ -30,10 +37,24 @@ class KittyLauncher:
     def _run(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
         return subprocess.run(args, check=False, capture_output=capture, text=True)
 
+    def start(self, total: int) -> None:
+        """No-op: kitty's grid layout adapts as tabs are added."""
+
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
-        """Spawn a new kitty window via ``kitty @ launch --type=window``."""
+        """Spawn a new kitty tab via ``kitty @ launch --type=tab``."""
         out = self._run(
-            ["kitty", "@", "launch", "--type=window", "--title", title, *attach_cmd],
+            [
+                "kitty",
+                "@",
+                "launch",
+                "--type=tab",
+                "--keep-focus",
+                "--tab-title",
+                title,
+                "--title",
+                title,
+                *attach_cmd,
+            ],
             capture=True,
         )
         if out.returncode != 0:
@@ -41,6 +62,9 @@ class KittyLauncher:
                 "kitty @ launch failed — make sure 'allow_remote_control yes' "
                 f"is set in kitty.conf. stderr: {(out.stderr or '').strip()}"
             )
+        # kitty prints the window id of the new tab's first window. We use
+        # that for close-window; matching by id is more reliable than by
+        # title (title can be customized after the fact).
         window_id = (out.stdout or "").strip()
         return BlockHandle(backend=self.name, data={"window_id": window_id, "title": title})
 

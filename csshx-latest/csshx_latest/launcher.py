@@ -1,12 +1,29 @@
 """Launcher Protocol and environment-based auto-detection.
 
+Author: Aditya Kapadia.
+
 A Launcher knows how to ask one specific terminal application (Wave,
 iTerm2, tmux, ...) to open a new visible block running an arbitrary
 command, and optionally to tile/title the resulting blocks.
 
 Concrete launchers live under :mod:`csshx_latest.launchers`. They are
-imported lazily in :func:`detect_launcher` so that selecting one
-backend doesn't pay the import cost of the others.
+imported lazily in :func:`_by_name` so that selecting one backend
+doesn't pay the import cost of the others.
+
+Lifecycle
+---------
+
+The orchestrator calls launcher methods in this order::
+
+    start(total)              # once, before any blocks open
+    open_block(...)           # once per host
+    tile(handles)             # after every open_block AND on resize
+    close_block(handle)       # once per host, on shutdown
+
+``start`` lets a launcher know up-front how many blocks it will be
+asked to open; that's how the tmux launcher decides between
+splitting the current pane and carving out a new window. The default
+implementation is a no-op.
 """
 from __future__ import annotations
 
@@ -35,6 +52,10 @@ class Launcher(Protocol):
 
     name: str
 
+    def start(self, total: int) -> None:
+        """Notify the launcher how many blocks will be opened in total."""
+        ...
+
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
         """Open a visible block and run ``attach_cmd`` inside it."""
         ...
@@ -52,7 +73,11 @@ class Launcher(Protocol):
         ...
 
 
-_LAUNCHERS = {
+# (module, class) pairs keyed by the public launcher name. The keys of
+# this dict are the single source of truth for ``--launcher`` choices --
+# ``__main__.py`` reads them so the CLI never drifts out of sync with
+# what's actually available.
+_LAUNCHERS: dict[str, tuple[str, str]] = {
     "waveterm": ("csshx_latest.launchers.waveterm", "WaveTermLauncher"),
     "tmux": ("csshx_latest.launchers.tmux", "TmuxLauncher"),
     "iterm2": ("csshx_latest.launchers.iterm2", "ITerm2Launcher"),
@@ -61,6 +86,11 @@ _LAUNCHERS = {
     "wezterm": ("csshx_latest.launchers.wezterm", "WezTermLauncher"),
     "manual": ("csshx_latest.launchers.manual", "ManualLauncher"),
 }
+
+
+def available_launcher_names() -> list[str]:
+    """Return the sorted list of valid ``--launcher`` choices, plus ``auto``."""
+    return ["auto", *sorted(_LAUNCHERS)]
 
 
 def _by_name(name: str) -> Launcher:
@@ -77,12 +107,28 @@ def detect_launcher(name: Optional[str] = None) -> Launcher:
     """Return a Launcher instance.
 
     If ``name`` is given (and not ``"auto"``), use that launcher
-    explicitly. Otherwise inspect environment variables in the priority
-    order documented in the project README. Falls back to the Manual
-    launcher if nothing is recognized — never silently picks tmux.
+    explicitly. Otherwise inspect environment variables in priority
+    order:
+
+    1. ``$TMUX`` -- tmux is checked *first* because a tmux session
+       running inside iTerm or Kitty leaves both ``TMUX`` *and*
+       ``TERM_PROGRAM``/``KITTY_PID`` set; the user's foreground
+       multiplexer is tmux, which is what should host the panes.
+    2. WaveTerm (``TERM_PROGRAM=waveterm`` + ``wsh`` on PATH).
+    3. iTerm2 (``TERM_PROGRAM=iTerm.app``).
+    4. Apple Terminal.app (``TERM_PROGRAM=Apple_Terminal``).
+    5. Kitty (``KITTY_PID`` set + ``kitty`` on PATH).
+    6. WezTerm (``TERM_PROGRAM=WezTerm`` + ``wezterm`` on PATH).
+
+    Falls back to the Manual launcher if nothing is recognized -- never
+    silently picks tmux without ``$TMUX``, never auto-spawns a new
+    multiplexer.
     """
     if name and name != "auto":
         return _by_name(name)
+
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        return _by_name("tmux")
 
     term_program = os.environ.get("TERM_PROGRAM", "")
 
@@ -96,6 +142,4 @@ def detect_launcher(name: Optional[str] = None) -> Launcher:
         return _by_name("kitty")
     if term_program == "WezTerm" and shutil.which("wezterm"):
         return _by_name("wezterm")
-    if os.environ.get("TMUX") and shutil.which("tmux"):
-        return _by_name("tmux")
     return _by_name("manual")

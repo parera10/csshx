@@ -20,6 +20,9 @@ class ManualLauncher:
     def __init__(self) -> None:
         self._counter = 0
 
+    def start(self, total: int) -> None:
+        """No-op: the manual launcher doesn't need a host-count hint."""
+
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
         """Print ``[N] <quoted attach command>   # <title>`` to stdout."""
         self._counter += 1

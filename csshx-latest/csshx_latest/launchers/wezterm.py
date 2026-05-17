@@ -15,6 +15,9 @@ class WezTermLauncher:
     def _run(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
         return subprocess.run(args, check=False, capture_output=capture, text=True)
 
+    def start(self, total: int) -> None:
+        """No-op: WezTerm balances panes automatically."""
+
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
         """Spawn a new pane and stamp the tab title with ``host``."""
         out = self._run(["wezterm", "cli", "spawn", "--", *attach_cmd], capture=True)
