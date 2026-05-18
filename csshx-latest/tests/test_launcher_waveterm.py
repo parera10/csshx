@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from csshx_latest.launcher import BlockHandle, Color
 from csshx_latest.launchers import waveterm as waveterm_mod
 
 
@@ -127,6 +128,100 @@ def test_tile_does_not_reprobe_when_all_variants_fail(monkeypatch):
     first = len(calls)
     l.tile([])  # Should be a no-op now — nothing cached, probe already done.
     assert len(calls) == first
+
+
+def test_tile_with_multiple_handles_still_runs_cached_subcommand(fake_run):
+    """tile() ignores handle topology — it just delegates to the cached wsh
+    subcommand. With 4 handles the call shape is the same as with 0; we only
+    care that it doesn't crash and that a tile-style subcommand was sent."""
+    l = waveterm_mod.WaveTermLauncher()
+    fake_run.clear()
+    handles = [
+        BlockHandle(backend="waveterm", data={"block_id": f"b-{i}", "title": f"h{i}"})
+        for i in range(4)
+    ]
+    l.tile(handles)
+    assert fake_run, "tile([handles]) should still invoke wsh"
+    flat = [arg for c in fake_run for arg in c]
+    assert any(a in ("tile", "tiled") for a in flat)
+
+
+def test_set_color_calls_wsh_setbg_with_enabled_hex(fake_run):
+    """ENABLED state must produce ``wsh setbg -b <id> #0e3d0e``."""
+    l = waveterm_mod.WaveTermLauncher()
+    h = l.open_block(["echo"], "h")
+    fake_run.clear()
+    l.set_color(h, Color.ENABLED)
+    assert fake_run == [["wsh", "setbg", "-b", "block-7", "#0e3d0e"]]
+
+
+def test_set_color_uses_distinct_hex_per_state(fake_run):
+    """Each Color state must map to its own hex from _BG_HEX."""
+    l = waveterm_mod.WaveTermLauncher()
+    h = l.open_block(["echo"], "h")
+    fake_run.clear()
+    l.set_color(h, Color.ENABLED)
+    l.set_color(h, Color.DISABLED)
+    l.set_color(h, Color.DEAD)
+    hexes = [c[-1] for c in fake_run]
+    assert hexes == [
+        waveterm_mod._BG_HEX[Color.ENABLED],
+        waveterm_mod._BG_HEX[Color.DISABLED],
+        waveterm_mod._BG_HEX[Color.DEAD],
+    ]
+    # Sanity: all three hexes are distinct.
+    assert len(set(hexes)) == 3
+
+
+def test_set_color_noop_when_no_block_id(fake_run):
+    """A handle without a block_id has nothing to tint — must not call wsh."""
+    l = waveterm_mod.WaveTermLauncher()
+    h = BlockHandle(backend="waveterm", data={"title": "no-id"})
+    fake_run.clear()
+    l.set_color(h, Color.ENABLED)
+    assert fake_run == []
+
+
+def test_set_color_caches_unsupported_after_first_failure(monkeypatch):
+    """If ``wsh setbg`` exits nonzero once, every later call must short-circuit."""
+    calls: list[list[str]] = []
+
+    def runner(args, check=False, capture_output=False, text=False):
+        calls.append(list(args))
+        if args[:2] == ["wsh", "run"]:
+            return subprocess.CompletedProcess(args, 0, stdout="block-9\n", stderr="")
+        if args[1] == "setbg":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="unknown cmd")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(waveterm_mod.subprocess, "run", runner)
+    l = waveterm_mod.WaveTermLauncher()
+    h = l.open_block(["echo"], "h")
+    calls.clear()
+
+    l.set_color(h, Color.ENABLED)  # probes, fails, caches False
+    first = len(calls)
+    assert first == 1
+    assert l._setbg_supported is False
+
+    # Subsequent calls must short-circuit entirely.
+    l.set_color(h, Color.DISABLED)
+    l.set_color(h, Color.DEAD)
+    assert len(calls) == first, "set_color must not re-probe after caching unsupported"
+
+
+def test_set_color_keeps_supported_flag_after_first_success(monkeypatch):
+    """A successful setbg flips _setbg_supported True so the fast path stays on."""
+    def runner(args, check=False, capture_output=False, text=False):
+        if args[:2] == ["wsh", "run"]:
+            return subprocess.CompletedProcess(args, 0, stdout="block-9\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(waveterm_mod.subprocess, "run", runner)
+    l = waveterm_mod.WaveTermLauncher()
+    h = l.open_block(["echo"], "h")
+    l.set_color(h, Color.ENABLED)
+    assert l._setbg_supported is True
 
 
 def test_resolve_wsh_prefers_path(monkeypatch):

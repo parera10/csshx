@@ -22,6 +22,19 @@ The token is read at runtime from ``<token_path>`` rather than passed
 on the command line so that ``ps`` listings can't be used by another
 local user to harvest the AUTH token. The token file is created by
 the master at mode ``0600`` inside a ``0700`` directory.
+
+Closing the visible terminal block
+----------------------------------
+
+When the user closes the spawned terminal window/pane/tab, this
+process either receives ``SIGHUP``/``SIGTERM``/``SIGINT`` from the
+terminal emulator (Apple Terminal, iTerm2) or reads ``EOF`` on its
+controlling TTY (tmux pane kill, Kitty tab close). In every case we
+send a best-effort ``BYE\\n`` line on the control socket before
+exiting so the master can mark the slave dead and update its status
+footer. Without this, ssh keeps running attached to the master's PTY
+and the user sees a stale "alive" count for a host they thought they
+closed.
 """
 from __future__ import annotations
 
@@ -33,6 +46,7 @@ import signal
 import socket
 import struct
 import sys
+from typing import Optional
 
 BUFSIZE = 4096
 
@@ -114,6 +128,22 @@ def _push_winsize(ctl_sock: socket.socket, in_fd: int) -> None:
         pass
 
 
+def _send_bye(ctl_sock: Optional[socket.socket]) -> None:
+    """Best-effort ``BYE`` on the control socket.
+
+    Safe to call from a signal handler: ``sendall`` of a ~4 byte line
+    on a UNIX domain socket is far below ``PIPE_BUF``, atomic, and
+    non-blocking enough to never re-enter the runtime. Idempotent at
+    the master side (``_handle_bye`` no-ops the second time).
+    """
+    if ctl_sock is None:
+        return
+    try:
+        ctl_sock.sendall(b"BYE\n")
+    except OSError:
+        pass
+
+
 def main(argv: list[str]) -> int:
     """Entry point. Returns the process exit code."""
     if len(argv) != 3:
@@ -135,7 +165,7 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"connect {path}: {exc}\n")
         return 1
 
-    ctl_sock: socket.socket | None = None
+    ctl_sock: Optional[socket.socket] = None
     try:
         ctl_sock = _connect_auth(_ctl_path_for(path), token)
     except OSError:
@@ -161,6 +191,36 @@ def main(argv: list[str]) -> int:
         except (OSError, ValueError):
             pass
         _push_winsize(ctl_sock, in_fd)
+
+    # Terminal emulators send SIGHUP when the user closes the visible
+    # block (Terminal.app, iTerm2). systemd / launchctl can deliver
+    # SIGTERM. Ctrl-C inside a pre-raw-mode interrupt window arrives
+    # as SIGINT. In every case the master needs to know this slave's
+    # session is over — push BYE then re-raise the default action so
+    # we still exit promptly. The handler is intentionally tiny and
+    # signal-safe (no allocation beyond sendall's own buffers).
+    bye_sent = {"flag": False}
+
+    def on_terminating_signal(signo, _frame) -> None:
+        if not bye_sent["flag"]:
+            bye_sent["flag"] = True
+            _send_bye(ctl_sock)
+        # Restore default disposition and re-raise so the OS does the
+        # right thing (default SIGHUP/SIGTERM/SIGINT all terminate).
+        try:
+            signal.signal(signo, signal.SIG_DFL)
+            os.kill(os.getpid(), signo)
+        except OSError:
+            pass
+
+    for _signo_name in ("SIGHUP", "SIGTERM", "SIGINT"):
+        sig = getattr(signal, _signo_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, on_terminating_signal)
+        except (OSError, ValueError):
+            pass
 
     watch_in = True
     received_any = False
@@ -199,6 +259,13 @@ def main(argv: list[str]) -> int:
                 except OSError:
                     data = b""
                 if not data:
+                    # Stdin EOF means the terminal block went away
+                    # without giving us a signal (e.g. tmux ``kill-pane``,
+                    # Kitty tab close). Mirror the signal-handler path
+                    # so the master always learns about the closure.
+                    if not bye_sent["flag"]:
+                        bye_sent["flag"] = True
+                        _send_bye(ctl_sock)
                     watch_in = False
                     try:
                         data_sock.shutdown(socket.SHUT_WR)
@@ -207,6 +274,9 @@ def main(argv: list[str]) -> int:
                 else:
                     data_sock.sendall(data)
     except KeyboardInterrupt:
+        if not bye_sent["flag"]:
+            bye_sent["flag"] = True
+            _send_bye(ctl_sock)
         return 130
     finally:
         if saved is not None:

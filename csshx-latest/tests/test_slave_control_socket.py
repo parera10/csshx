@@ -60,6 +60,75 @@ def test_apply_control_line_rejects_bad_grammar():
         _apply_control_line(slave, b"\n")
         _apply_control_line(slave, b"\xff\xfe\n")  # non-ascii
         _apply_control_line(slave, b"WINSZ -1 80\n")  # non-positive
+        _apply_control_line(slave, b"BYE extra\n")  # BYE takes no args
+    finally:
+        os.close(pty_master)
+        os.close(pty_slave)
+
+
+def test_apply_control_line_bye_marks_user_closed_and_sigterms_ssh(harmless_pid):
+    """``BYE`` sets ``user_closed=True`` and sends SIGTERM to the ssh pid.
+
+    This is the path that makes "close the terminal window → slave
+    actually exits" work. We mock os.kill so we don't actually kill the
+    fixture's helper process; we only need to verify the SIGTERM was
+    issued with the right pid.
+    """
+    import pty
+    import signal as _signal
+    import unittest.mock
+
+    from csshx_latest import slave as slave_mod
+
+    pty_master, pty_slave = pty.openpty()
+    try:
+        slave = _make_slave("", "", pty_master, harmless_pid)
+        assert slave.user_closed is False
+
+        with unittest.mock.patch.object(slave_mod.os, "kill") as fake_kill:
+            _apply_control_line(slave, b"BYE\n")
+
+        assert slave.user_closed is True
+        fake_kill.assert_called_once_with(harmless_pid, _signal.SIGTERM)
+    finally:
+        os.close(pty_master)
+        os.close(pty_slave)
+
+
+def test_apply_control_line_bye_is_idempotent(harmless_pid):
+    """A second ``BYE`` after the first is a silent no-op (no extra SIGTERM)."""
+    import pty
+    import unittest.mock
+
+    from csshx_latest import slave as slave_mod
+
+    pty_master, pty_slave = pty.openpty()
+    try:
+        slave = _make_slave("", "", pty_master, harmless_pid)
+        with unittest.mock.patch.object(slave_mod.os, "kill") as fake_kill:
+            _apply_control_line(slave, b"BYE\n")
+            _apply_control_line(slave, b"BYE\n")
+        assert fake_kill.call_count == 1
+    finally:
+        os.close(pty_master)
+        os.close(pty_slave)
+
+
+def test_apply_control_line_bye_skips_kill_for_already_dead_slave(harmless_pid):
+    """If ``slave.dead`` is already set (natural ssh exit), BYE does not SIGTERM."""
+    import pty
+    import unittest.mock
+
+    from csshx_latest import slave as slave_mod
+
+    pty_master, pty_slave = pty.openpty()
+    try:
+        slave = _make_slave("", "", pty_master, harmless_pid)
+        slave.dead = True  # PTY EOF beat the BYE to the punch
+        with unittest.mock.patch.object(slave_mod.os, "kill") as fake_kill:
+            _apply_control_line(slave, b"BYE\n")
+        assert slave.user_closed is True
+        fake_kill.assert_not_called()
     finally:
         os.close(pty_master)
         os.close(pty_slave)

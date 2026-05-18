@@ -12,10 +12,28 @@ token:
   client immediately after AUTH succeeds.
 
 * ``slave-N.ctl`` -- the control socket. After AUTH it accepts
-  line-oriented commands. Today the only command is
-  ``WINSZ rows cols [xpixel ypixel]`` which applies ``TIOCSWINSZ`` to
-  the PTY master so the remote ssh side learns the new size when the
-  *individual* terminal block (not just the master) is resized.
+  line-oriented ASCII commands, one per line. Supported commands::
+
+      WINSZ <rows> <cols> [<xpixel> <ypixel>]
+      BYE
+
+  ``WINSZ`` applies ``TIOCSWINSZ`` to the PTY master so the remote
+  ssh side learns the new size when the *individual* terminal block
+  (not just the master) is resized.
+
+  ``BYE`` signals "the user closed this block." The slave is marked
+  ``user_closed`` and the ssh pid is sent ``SIGTERM`` so the remote
+  session ends. The natural PTY-EOF path then fires ``on_dead`` so
+  the status footer's alive/dead counters update and (with
+  ``--reconnect``) the retry schedule is suppressed because the
+  termination was user-initiated.
+
+  The grammar is intentionally forward-compatible: ``_apply_control_line``
+  silently ignores any unknown command verb so an older attach client
+  never breaks when newer slaves grow new ones. Reserved future verbs
+  include ``BELL``, ``FOCUS``, ``RESIZE`` (a structured rename of
+  ``WINSZ``) — when adding a new verb, follow the WINSZ shape:
+  ``VERB <arg1> [<arg2> ...]\\n``, ASCII only, no quoting.
 
 Input direction (data socket -> PTY) accepts bytes from the focused
 terminal block AND from the master's broadcaster, both serialized
@@ -39,14 +57,21 @@ import logging
 import os
 import signal
 import socket
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from csshx_latest.auth import authenticate
 from csshx_latest.terminal import set_winsize
 
 log = logging.getLogger(__name__)
+
+#: Per-slave cap on simultaneous authenticated data-socket clients.
+#: A legitimate run has one (the spawned terminal block). Allowing a
+#: handful supports re-attach + a side-channel for tooling; rejecting
+#: beyond that contains the blast radius of a leaked token.
+DEFAULT_MAX_WRITERS = 4
 
 
 @dataclass
@@ -63,6 +88,11 @@ class Slave:
     ctl_sock_path: str = ""
     enabled: bool = True
     dead: bool = False
+    #: Set to True when the visible terminal block is destroyed and its
+    #: attach client sent ``BYE``. Used by the orchestrator to suppress
+    #: ``--reconnect`` for slaves the user explicitly killed.
+    user_closed: bool = False
+    max_writers: int = DEFAULT_MAX_WRITERS
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     server: Optional[asyncio.AbstractServer] = field(default=None, repr=False)
     ctl_server: Optional[asyncio.AbstractServer] = field(default=None, repr=False)
@@ -72,15 +102,27 @@ class Slave:
     scrollback_max: int = 65536
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     on_dead: Optional[Callable[["Slave"], None]] = field(default=None, repr=False)
+    #: Opaque ``BlockHandle`` returned by ``launcher.open_block``. Stored
+    #: here so dead-slave / reconnect / state-change paths can repaint
+    #: the block without the orchestrator threading the mapping
+    #: separately. ``Any`` (not ``BlockHandle``) to avoid an import cycle.
+    handle: Optional[Any] = field(default=None, repr=False)
 
 
 @contextmanager
 def _temporary_umask(mask: int) -> Iterator[None]:
     """Set process umask to ``mask`` for the duration of the block.
 
-    Process-global; not thread-safe. Only called on the event loop
-    during single-threaded slave setup, so safe in practice.
+    Process-global; not thread-safe. The assertion enforces the
+    invariant the rest of the orchestrator relies on (single-threaded
+    slave setup on the event loop). If a future change starts running
+    socket creation through ``asyncio.to_thread`` the assertion will
+    fire and force introduction of a real lock rather than producing a
+    silent race.
     """
+    assert threading.current_thread() is threading.main_thread(), (
+        "_temporary_umask is process-global; must be called on the main thread"
+    )
     prev = os.umask(mask)
     try:
         yield
@@ -167,6 +209,20 @@ async def run_slave_bridge(slave: Slave) -> None:
                 pass
             return
         async with slave.state_lock:
+            # Bound the writer fan-out so a leaked token can't be
+            # used to attach indefinitely. Reject *after* AUTH so the
+            # check itself isn't a probe oracle.
+            if len(slave.connected_writers) >= slave.max_writers:
+                log.warning(
+                    "slave %d (%s): rejecting attach -- max_writers=%d reached",
+                    slave.index, slave.host, slave.max_writers,
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
             if slave.scrollback:
                 writer.write(bytes(slave.scrollback))
             slave.connected_writers.append(writer)
@@ -284,6 +340,7 @@ def _apply_control_line(slave: Slave, line: bytes) -> None:
     Supported grammar::
 
         WINSZ <rows> <cols> [<xpixel> <ypixel>]
+        BYE
 
     Anything else is ignored (with a debug log) so the protocol can grow
     without breaking older attach clients.
@@ -295,6 +352,9 @@ def _apply_control_line(slave: Slave, line: bytes) -> None:
     if not text:
         return
     parts = text.split()
+    if parts[0] == "BYE" and len(parts) == 1:
+        _handle_bye(slave)
+        return
     if parts[0] != "WINSZ" or len(parts) not in (3, 5):
         log.debug("slave %s: unknown control line %r", slave.index, text)
         return
@@ -309,6 +369,29 @@ def _apply_control_line(slave: Slave, line: bytes) -> None:
     if rows <= 0 or cols <= 0:
         return
     set_winsize(slave.pty_master, rows, cols, xp, yp)
+
+
+def _handle_bye(slave: Slave) -> None:
+    """Treat ``BYE`` as user-initiated shutdown of this slave's session.
+
+    Marks ``user_closed`` (so ``--reconnect`` skips retries) and sends
+    ``SIGTERM`` to the remote ssh pid. The natural PTY-EOF chain in
+    :func:`run_slave_bridge` then fires ``on_dead`` exactly once, so
+    the status footer repaints and the launcher's set_color hook
+    flips the block to DEAD without any extra plumbing.
+
+    Idempotent: a second BYE on an already-dead slave is a no-op.
+    """
+    if slave.user_closed:
+        return
+    slave.user_closed = True
+    log.debug("slave %s (%s) BYE received -- terminating ssh pid %d",
+              slave.index, slave.host, slave.pid)
+    if slave.pid > 0 and not slave.dead:
+        try:
+            os.kill(slave.pid, signal.SIGTERM)
+        except OSError as exc:
+            log.debug("slave %s SIGTERM failed: %s", slave.index, exc)
 
 
 async def write_to_slave(slave: Slave, data: bytes) -> None:

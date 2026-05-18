@@ -123,6 +123,44 @@ def _is_zombie_or_dead(pid: int) -> bool:
         return True
 
 
+def _bare_slave(**overrides):
+    """Build a minimal Slave for decision-helper tests (no PTY / sockets)."""
+    from csshx_latest.slave import Slave
+
+    defaults = dict(
+        index=1,
+        host="h",
+        sock_path="/tmp/x",
+        token="t",
+        pty_master=-1,
+        pid=0,
+    )
+    defaults.update(overrides)
+    return Slave(**defaults)
+
+
+def test_should_reconnect_true_when_flag_on_and_not_user_closed():
+    """Normal ssh death with ``--reconnect`` → respawn."""
+    s = _bare_slave(dead=True, user_closed=False)
+    assert orchestrator._should_reconnect(s, reconnect_enabled=True) is True
+
+
+def test_should_reconnect_false_when_flag_off():
+    """Without ``--reconnect``, no respawn even for an unexpected death."""
+    s = _bare_slave(dead=True, user_closed=False)
+    assert orchestrator._should_reconnect(s, reconnect_enabled=False) is False
+
+
+def test_should_reconnect_false_when_user_closed_block():
+    """User closed the terminal block → BYE → must NOT respawn even with --reconnect.
+
+    This is the guard that prevents a closed slave from silently
+    coming back to life one backoff cycle later.
+    """
+    s = _bare_slave(dead=True, user_closed=True)
+    assert orchestrator._should_reconnect(s, reconnect_enabled=True) is False
+
+
 def test_run_master_refuses_above_max_hosts(monkeypatch, capsys):
     """The hard cap rejects oversize host lists before touching launchers."""
     class FakeLauncher:

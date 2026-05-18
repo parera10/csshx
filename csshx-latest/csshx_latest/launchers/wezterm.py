@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import subprocess
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
 
 
 class WezTermLauncher:
@@ -42,3 +42,6 @@ class WezTermLauncher:
         if not pane_id:
             return
         self._run(["wezterm", "cli", "set-tab-title", "--pane-id", pane_id, title])
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """WezTerm has no CLI hook for per-pane background tint."""

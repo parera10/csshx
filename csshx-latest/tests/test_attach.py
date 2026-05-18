@@ -140,6 +140,97 @@ def test_missing_token_file_returns_1(short_socket_dir, capsys):
     assert "token" in err
 
 
+def test_send_bye_writes_bye_line_to_ctl_sock():
+    """``_send_bye`` writes the literal ``BYE\\n`` to its argument socket."""
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        attach._send_bye(parent)
+        # Drain whatever the kernel buffered. ``BYE\n`` is 4 bytes; one recv
+        # is enough on a freshly-created stream socket.
+        got = child.recv(64)
+        assert got == b"BYE\n"
+    finally:
+        parent.close()
+        child.close()
+
+
+def test_send_bye_is_silent_on_closed_socket():
+    """``_send_bye`` must swallow OSError so it can run from a signal handler."""
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    child.close()
+    parent.close()
+    # Must not raise even though the underlying fd is dead.
+    attach._send_bye(parent)
+
+
+def test_send_bye_handles_none_ctl_sock():
+    """``_send_bye(None)`` is a silent no-op (control socket may have failed)."""
+    attach._send_bye(None)  # must not raise
+
+
+def test_stdin_eof_emits_bye_on_ctl_socket(
+    short_socket_dir, stdio_devnull, capsys
+):
+    """Closing the visible block (stdin EOF) must push ``BYE`` to the master.
+
+    This is the contract that makes the alive/dead counter update when
+    a user closes a Terminal.app window / iTerm2 pane / tmux pane. We
+    stand up both a data and a control AF_UNIX socket; the data socket
+    sends a byte (so the client moves past the "AUTH rejected" early-
+    exit guard), and the control socket records everything that
+    arrives. With ``stdio_devnull`` the client's stdin reads EOF on the
+    first iteration, the EOF branch fires ``_send_bye``, and we should
+    see ``BYE\\n`` on the control socket.
+    """
+    sock_path = os.path.join(short_socket_dir, "happy.sock")
+    ctl_path = os.path.join(short_socket_dir, "happy.ctl")
+    token_path = _write_token(short_socket_dir, "TOKEN")
+
+    def serve_data(conn: socket.socket) -> None:
+        try:
+            conn.recv(4096)  # AUTH
+            conn.sendall(b"hello\n")  # arms received_any so EOF returns 0
+        except OSError:
+            pass
+
+    ctl_received: list[bytes] = []
+    ctl_done = threading.Event()
+
+    def serve_ctl(conn: socket.socket) -> None:
+        try:
+            conn.recv(4096)  # AUTH
+            # Loop briefly to collect post-AUTH lines.
+            conn.settimeout(2.0)
+            while True:
+                try:
+                    chunk = conn.recv(4096)
+                except (OSError, socket.timeout):
+                    break
+                if not chunk:
+                    break
+                ctl_received.append(chunk)
+        finally:
+            ctl_done.set()
+
+    srv_d, t_d = _start_unix_server(sock_path, serve_data)
+    srv_c, t_c = _start_unix_server(ctl_path, serve_ctl)
+    try:
+        rc = attach.main(["attach", sock_path, token_path])
+    finally:
+        srv_d.close()
+        srv_c.close()
+        ctl_done.wait(timeout=2)
+        t_d.join(timeout=2)
+        t_c.join(timeout=2)
+
+    assert rc == 0
+    blob = b"".join(ctl_received)
+    # The control socket must have seen the BYE line we send on stdin EOF.
+    # WINSZ probes may also be sent (depending on devnull's ioctl support)
+    # but BYE is the one we care about.
+    assert b"BYE\n" in blob, f"expected BYE in ctl traffic, got: {blob!r}"
+
+
 def test_token_file_contents_are_used(short_socket_dir, stdio_devnull, capsys):
     """The bytes sent on AUTH must come from the token file, not from argv."""
     sock_path = os.path.join(short_socket_dir, "auth.sock")

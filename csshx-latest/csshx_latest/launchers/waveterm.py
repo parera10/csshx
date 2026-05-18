@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from typing import Optional
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,15 @@ _TILE_VARIANTS: tuple[tuple[str, ...], ...] = (
     ("layout", "tiled"),
     ("tile",),
 )
+
+#: Hex backgrounds per state. WaveTerm's ``wsh setbg`` accepts a CSS
+#: color; we use the same palette family as tmux/kitty so the visual
+#: cue stays consistent across backends.
+_BG_HEX: dict[Color, str] = {
+    Color.ENABLED: "#0e3d0e",
+    Color.DISABLED: "#3a3a3a",
+    Color.DEAD: "#4d1414",
+}
 
 #: Fallback locations to search for the ``wsh`` binary when it isn't on PATH
 #: (e.g. when csshx-latest is launched directly via a WaveTerm widget's
@@ -141,6 +150,12 @@ class WaveTermLauncher:
         self._counter = 0
         self._tile_cmd: Optional[tuple[str, ...]] = None
         self._tile_probed = False
+        # ``setbg`` was added in a recent ``wsh`` release. We probe once
+        # (lazy on first :meth:`set_color` call) and cache the result so
+        # older WaveTerm installs aren't spammed with unknown-command
+        # errors. ``None`` = not probed; ``False`` = unsupported here;
+        # ``True`` = supported, keep calling.
+        self._setbg_supported: Optional[bool] = None
         self._wsh = _resolve_wsh()
         _swap_waveterm_token(self._wsh)
 
@@ -206,3 +221,29 @@ class WaveTermLauncher:
         if not block_id:
             return
         self._run([self._wsh, "settitle", "-b", block_id, title])
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """Tint the block background via ``wsh setbg`` (best-effort).
+
+        Lazily probes once: if the local ``wsh`` doesn't ship ``setbg``,
+        we cache that and silently no-op every subsequent call so we
+        never burn a subprocess on a known-unsupported command.
+        """
+        block_id = handle.data.get("block_id")
+        if not block_id:
+            return
+        if self._setbg_supported is False:
+            return
+        hex_bg = _BG_HEX.get(color)
+        if not hex_bg:
+            return
+        out = self._run([self._wsh, "setbg", "-b", block_id, hex_bg])
+        if out.returncode != 0:
+            if self._setbg_supported is None:
+                log.debug(
+                    "wsh setbg unsupported (exit=%d, stderr=%r); disabling for this run",
+                    out.returncode, (out.stderr or "").strip(),
+                )
+                self._setbg_supported = False
+            return
+        self._setbg_supported = True

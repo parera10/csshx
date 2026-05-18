@@ -9,7 +9,7 @@ from __future__ import annotations
 import shlex
 import sys
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
 
 
 class ManualLauncher:
@@ -40,3 +40,6 @@ class ManualLauncher:
 
     def set_title(self, handle: BlockHandle, title: str) -> None:
         """No-op: titles are whatever the user's terminal already shows."""
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """No-op: the manual launcher has no UI surface to paint."""

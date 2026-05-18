@@ -27,10 +27,34 @@ implementation is a no-op.
 """
 from __future__ import annotations
 
+import enum
 import os
 import shutil
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
+
+
+class Color(enum.Enum):
+    """Per-block state colors — mirrors the original csshX color taxonomy.
+
+    The Perl csshX used four states (``selected``, ``disabled``,
+    ``master``, ``setbounds``); for a TUI without a separate master
+    window we only need three:
+
+    * :attr:`ENABLED`  — broadcast is on (csshX ``selected``).
+    * :attr:`DISABLED` — broadcast is off but the host is alive
+      (csshX ``disabled``).
+    * :attr:`DEAD`     — ssh has exited.
+
+    Concrete launchers translate these into their native paint
+    primitives (tmux ``select-pane -P``, wsh ``setbg``, kitty
+    ``set-tab-color``, etc.). Launchers without a paint API treat
+    every value as a no-op.
+    """
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    DEAD = "dead"
 
 
 @dataclass
@@ -70,6 +94,10 @@ class Launcher(Protocol):
 
     def set_title(self, handle: BlockHandle, title: str) -> None:
         """Rename a block. May be a no-op."""
+        ...
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """Paint a block to reflect its broadcast state. May be a no-op."""
         ...
 
 

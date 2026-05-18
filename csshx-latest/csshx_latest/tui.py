@@ -2,7 +2,7 @@
 
 Author: Aditya Kapadia.
 
-Command mode (``Ctrl-T`` prefix, then one key):
+Command mode (configurable prefix, default ``Ctrl-T``, then one key):
 
 * ``b`` -- toggle broadcast for ALL alive slaves
 * ``1`` ... ``9`` -- toggle broadcast for that single slave
@@ -10,8 +10,10 @@ Command mode (``Ctrl-T`` prefix, then one key):
 * ``l`` -- list slaves with their state
 * ``q`` -- quit
 * ``?`` -- show command-mode help
-* ``Ctrl-T`` -- send a literal ``Ctrl-T`` byte to slaves
-* (any other key) -- cancel command mode
+* ``<prefix>`` (typed twice) -- send a literal prefix byte to slaves
+* printable letter not in the dispatch -- cancel command mode AND
+  broadcast that letter (so typo doesn't silently vanish)
+* control byte (Esc, Ctrl-C, ...) -- cancel command mode silently
 """
 from __future__ import annotations
 
@@ -27,18 +29,78 @@ from csshx_latest.terminal import get_winsize, raw_mode, set_winsize
 log = logging.getLogger(__name__)
 
 KEY_QUIT = b"\x11"               # Ctrl-Q
-KEY_COMMAND_PREFIX = b"\x14"     # Ctrl-T
+KEY_COMMAND_PREFIX = b"\x14"     # Ctrl-T (default prefix)
 KEY_INDEX_PROMPT = b"i"
 
+#: ANSI escape codes for the colored status footer. Skipped when the
+#: footer destination (stderr) isn't a TTY.
+_ANSI_GREEN = "\x1b[32m"
+_ANSI_RED = "\x1b[31m"
+_ANSI_DIM = "\x1b[2m"
+_ANSI_RESET = "\x1b[0m"
 
-def render_status(bcast: Broadcaster) -> None:
-    """Write a one-line status footer to stderr."""
+
+def parse_command_key(spec: str) -> bytes:
+    """Parse a ``--command-key`` spec into a single byte.
+
+    Accepts:
+
+    * ``^X`` / ``^x`` (Ctrl-X), where X is an ASCII letter
+    * ``0x14`` hex literal
+    * a single literal printable character
+
+    Raises ``ValueError`` on anything else.
+    """
+    if not spec:
+        raise ValueError("empty")
+    s = spec.strip()
+    if len(s) == 2 and s[0] == "^":
+        ch = s[1].upper()
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"^X requires A-Z, got {s!r}")
+        return bytes([ord(ch) - 0x40])
+    if s.lower().startswith("0x"):
+        try:
+            v = int(s, 16)
+        except ValueError:
+            raise ValueError(f"bad hex: {s!r}")
+        if not 0 <= v <= 0xFF:
+            raise ValueError(f"hex out of byte range: {s!r}")
+        return bytes([v])
+    if len(s) == 1:
+        return s.encode("ascii", errors="strict")
+    raise ValueError(f"unrecognized command-key spec: {s!r}")
+
+
+def _key_label(prefix: bytes) -> str:
+    """Render ``b"\\x14"`` as ``Ctrl-T`` for the help / status lines."""
+    if not prefix or len(prefix) != 1:
+        return repr(prefix)
+    b = prefix[0]
+    if 1 <= b <= 26:
+        return f"Ctrl-{chr(b + 0x40)}"
+    return repr(prefix)
+
+
+def render_status(bcast: Broadcaster, command_key: bytes = KEY_COMMAND_PREFIX) -> None:
+    """Write a one-line status footer to stderr.
+
+    Colorizes the ``enabled`` / ``dead`` counters when stderr is a tty
+    so the eye can spot a broken host in a wall of text.
+    """
     total = len(bcast.slaves)
     enabled = len(bcast.enabled_indices())
     dead = sum(1 for s in bcast.slaves if s.dead)
+    tty = sys.stderr.isatty()
+    if tty:
+        en_s = f"{_ANSI_GREEN}{enabled}{_ANSI_RESET}" if enabled else f"{_ANSI_DIM}0{_ANSI_RESET}"
+        dead_s = f"{_ANSI_RED}{dead}{_ANSI_RESET}" if dead else f"{_ANSI_DIM}0{_ANSI_RESET}"
+    else:
+        en_s = str(enabled)
+        dead_s = str(dead)
     sys.stderr.write(
-        f"\r[csshx-latest] hosts: {total}  enabled: {enabled}  "
-        f"dead: {dead}  (Ctrl-Q quit, Ctrl-T menu)\r\n"
+        f"\r[csshx-latest] hosts: {total}  enabled: {en_s}  "
+        f"dead: {dead_s}  (Ctrl-Q quit, {_key_label(command_key)} menu)\r\n"
     )
     sys.stderr.flush()
 
@@ -48,7 +110,8 @@ def _write_msg(msg: str) -> None:
     sys.stderr.flush()
 
 
-def _render_help() -> None:
+def _render_help(command_key: bytes = KEY_COMMAND_PREFIX) -> None:
+    label = _key_label(command_key)
     _write_msg("--- csshx-latest command mode ---")
     _write_msg("  b        toggle broadcast for ALL alive slaves")
     _write_msg("  1..9     toggle broadcast for that single slave")
@@ -56,8 +119,8 @@ def _render_help() -> None:
     _write_msg("  l        list slaves and their state")
     _write_msg("  q        quit")
     _write_msg("  ?        show this help")
-    _write_msg("  Ctrl-T   send a literal Ctrl-T")
-    _write_msg("  (other)  cancel command mode")
+    _write_msg(f"  {label:<7}  send a literal {label}")
+    _write_msg("  (other)  cancel command mode (printable echoes)")
 
 
 def _render_list(bcast: Broadcaster) -> None:
@@ -91,45 +154,62 @@ class _CommandState:
 
 
 async def _handle_command_byte(
-    bcast: Broadcaster, byte: int, quit_event: asyncio.Event
+    bcast: Broadcaster,
+    byte: int,
+    quit_event: asyncio.Event,
+    command_key: bytes = KEY_COMMAND_PREFIX,
 ) -> bytes:
     """Apply one command-mode keystroke.
 
-    Returns any bytes that should still be broadcast (e.g. the user
-    pressed Ctrl-T twice -> send a literal Ctrl-T). Empty bytes mean
-    "consumed, broadcast nothing".
+    Returns any bytes that should still be broadcast. Two cases push
+    bytes back into the broadcast stream:
+
+    * the user typed the prefix twice -> send a literal prefix byte
+    * the user typed a printable letter that isn't bound -> cancel
+      command mode AND broadcast that letter (so a typo never silently
+      vanishes, matching the original csshX behavior)
     """
     ch = bytes([byte])
-    if ch == KEY_COMMAND_PREFIX:
-        return KEY_COMMAND_PREFIX
+    if ch == command_key:
+        return command_key
     if ch == b"b":
         any_enabled = any(s.enabled for s in bcast.slaves if not s.dead)
         bcast.set_all_enabled(not any_enabled)
         _write_msg(f"broadcast -> {'OFF' if any_enabled else 'ON'} for all alive slaves")
-        render_status(bcast)
+        render_status(bcast, command_key)
         return b""
     if ch in (b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9"):
         _toggle_slave(bcast, int(ch))
-        render_status(bcast)
+        render_status(bcast, command_key)
         return b""
     if ch == b"l":
         _render_list(bcast)
-        render_status(bcast)
+        render_status(bcast, command_key)
         return b""
     if ch == b"q":
         _write_msg("quitting...")
         quit_event.set()
         return b""
     if ch == b"?":
-        _render_help()
-        render_status(bcast)
+        _render_help(command_key)
+        render_status(bcast, command_key)
         return b""
+    # Printable ASCII that wasn't bound: cancel command mode and let the
+    # byte through so the user's typo lands in the broadcast stream
+    # instead of silently disappearing. Control bytes (Esc, Ctrl-C, etc.)
+    # cancel silently.
+    if 0x20 <= byte <= 0x7E:
+        _write_msg(f"(command-mode cancelled; broadcasting {ch!r})")
+        render_status(bcast, command_key)
+        return ch
     _write_msg("(command-mode cancelled)")
-    render_status(bcast)
+    render_status(bcast, command_key)
     return b""
 
 
-async def tui_loop(bcast: Broadcaster) -> None:
+async def tui_loop(
+    bcast: Broadcaster, command_key: bytes = KEY_COMMAND_PREFIX
+) -> None:
     """Read stdin in raw mode and broadcast keystrokes; render a status line."""
     if not sys.stdin.isatty():
         await asyncio.Event().wait()
@@ -157,7 +237,14 @@ async def tui_loop(bcast: Broadcaster) -> None:
         pass
 
     on_sigwinch()
-    render_status(bcast)
+    # One-line startup hint so first-time users discover the menu prefix
+    # without reading docs. Skipped if stderr isn't a TTY (logs, pipes).
+    if sys.stderr.isatty():
+        _write_msg(
+            f"[csshx-latest] press {_key_label(command_key)} for the command menu, "
+            "Ctrl-Q to quit."
+        )
+    render_status(bcast, command_key)
 
     with raw_mode():
         reader = asyncio.StreamReader()
@@ -179,11 +266,13 @@ async def tui_loop(bcast: Broadcaster) -> None:
                 if (
                     not state.in_command
                     and not state.in_index_prompt
-                    and KEY_COMMAND_PREFIX not in data
+                    and command_key not in data
                 ):
                     await bcast.broadcast(data)
                     continue
-                await _drain_with_command_handling(data, bcast, state, quit_event)
+                await _drain_with_command_handling(
+                    data, bcast, state, quit_event, command_key
+                )
 
         task = asyncio.create_task(reader_task())
         try:
@@ -198,6 +287,7 @@ async def _drain_with_command_handling(
     bcast: Broadcaster,
     state: _CommandState,
     quit_event: asyncio.Event,
+    command_key: bytes = KEY_COMMAND_PREFIX,
 ) -> None:
     """Walk a chunk byte-by-byte when command / index-prompt mode is live."""
     buf = bytearray()
@@ -206,7 +296,7 @@ async def _drain_with_command_handling(
             if buf:
                 await bcast.broadcast(bytes(buf))
                 buf.clear()
-            _consume_index_prompt_byte(b, bcast, state)
+            _consume_index_prompt_byte(b, bcast, state, command_key)
             continue
         if state.in_command:
             if buf:
@@ -218,12 +308,12 @@ async def _drain_with_command_handling(
                 state.index_buffer.clear()
                 _write_msg("index: (type digits, Enter to apply, Esc to cancel)")
                 continue
-            extra = await _handle_command_byte(bcast, b, quit_event)
+            extra = await _handle_command_byte(bcast, b, quit_event, command_key)
             state.in_command = False
             if extra:
                 buf.extend(extra)
             continue
-        if bytes([b]) == KEY_COMMAND_PREFIX:
+        if bytes([b]) == command_key:
             if buf:
                 await bcast.broadcast(bytes(buf))
                 buf.clear()
@@ -235,12 +325,17 @@ async def _drain_with_command_handling(
         await bcast.broadcast(bytes(buf))
 
 
-def _consume_index_prompt_byte(b: int, bcast: Broadcaster, state: _CommandState) -> None:
+def _consume_index_prompt_byte(
+    b: int,
+    bcast: Broadcaster,
+    state: _CommandState,
+    command_key: bytes = KEY_COMMAND_PREFIX,
+) -> None:
     """Process one byte while we're collecting digits for the index prompt."""
     if b in (0x1B, 0x03):
         _write_msg("(index prompt cancelled)")
         state.reset()
-        render_status(bcast)
+        render_status(bcast, command_key)
         return
     if b in (ord("\r"), ord("\n")):
         if not state.index_buffer:
@@ -253,7 +348,7 @@ def _consume_index_prompt_byte(b: int, bcast: Broadcaster, state: _CommandState)
             else:
                 _toggle_slave(bcast, idx)
         state.reset()
-        render_status(bcast)
+        render_status(bcast, command_key)
         return
     if b in (0x7F, 0x08):
         if state.index_buffer:

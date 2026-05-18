@@ -18,7 +18,16 @@ from __future__ import annotations
 import shutil
 import subprocess
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
+
+#: Hex backgrounds for the per-tab color tint. Same palette family
+#: as the tmux launcher to keep the visual language consistent across
+#: backends.
+_TAB_BG: dict[Color, str] = {
+    Color.ENABLED: "#0e3d0e",   # dark green
+    Color.DISABLED: "#3a3a3a",  # neutral grey
+    Color.DEAD: "#4d1414",      # dark red
+}
 
 
 class KittyLauncher:
@@ -85,3 +94,23 @@ class KittyLauncher:
         if not wid:
             return
         self._run(["kitty", "@", "set-window-title", "--match", f"id:{wid}", title])
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """Tint the containing tab via ``kitty @ set-tab-color``.
+
+        Requires kitty >= 0.20. A non-zero exit (e.g. older kitty)
+        is silently ignored — the rest of the broadcast still works,
+        the user just doesn't get the visual hint.
+        """
+        wid = handle.data.get("window_id")
+        if not wid:
+            return
+        hex_bg = _TAB_BG.get(color)
+        if not hex_bg:
+            return
+        self._run([
+            "kitty", "@", "set-tab-color",
+            "--match", f"window_id:{wid}",
+            f"active_bg={hex_bg}",
+            f"inactive_bg={hex_bg}",
+        ])

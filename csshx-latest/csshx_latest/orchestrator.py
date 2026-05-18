@@ -46,7 +46,7 @@ from typing import Optional
 
 from csshx_latest.auth import make_token, write_token_file
 from csshx_latest.broadcaster import Broadcaster
-from csshx_latest.launcher import BlockHandle, Launcher
+from csshx_latest.launcher import BlockHandle, Color, Launcher
 from csshx_latest.slave import (
     Slave,
     run_slave_bridge,
@@ -54,7 +54,7 @@ from csshx_latest.slave import (
     spawn_slave,
 )
 from csshx_latest.terminal import get_winsize
-from csshx_latest.tui import render_status, tui_loop
+from csshx_latest.tui import KEY_COMMAND_PREFIX, render_status, tui_loop
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +134,49 @@ async def _start_launcher(launcher: Launcher, total: int) -> None:
         await asyncio.to_thread(launcher.start, total)
     except Exception as exc:
         log.warning("launcher.start failed: %s", exc)
+
+
+def _color_for(slave: Slave) -> Color:
+    """Map slave state to its visual color (mirrors original csshX)."""
+    if slave.dead:
+        return Color.DEAD
+    if slave.enabled:
+        return Color.ENABLED
+    return Color.DISABLED
+
+
+def _should_reconnect(slave: Slave, reconnect_enabled: bool) -> bool:
+    """Return True iff a dead slave should be auto-respawned.
+
+    Two conditions both have to hold:
+
+    * the user passed ``--reconnect`` on the CLI, AND
+    * the slave was NOT killed by the user closing its visible terminal
+      block. A ``BYE`` on the control socket flips ``user_closed`` and
+      we honor that: the user explicitly ended this session, so resurrecting
+      it would be surprising.
+    """
+    return reconnect_enabled and not slave.user_closed
+
+
+async def _set_color(launcher: Launcher, slave: Slave) -> None:
+    """Push the slave's current state color to its block (best-effort)."""
+    if slave.handle is None:
+        return
+    try:
+        await asyncio.to_thread(launcher.set_color, slave.handle, _color_for(slave))
+    except Exception as exc:
+        log.debug("set_color slave %d failed: %s", slave.index, exc)
+
+
+async def _set_title(launcher: Launcher, slave: Slave, title: str) -> None:
+    """Push a per-block title rename (best-effort)."""
+    if slave.handle is None:
+        return
+    try:
+        await asyncio.to_thread(launcher.set_title, slave.handle, title)
+    except Exception as exc:
+        log.debug("set_title slave %d failed: %s", slave.index, exc)
 
 
 def _master_winsize() -> tuple[int, int, int, int]:
@@ -224,8 +267,18 @@ async def _attempt_reconnect(
     ssh_args: list[str],
     login: Optional[str],
     winsize: tuple[int, int, int, int],
+    launcher: Optional[Launcher] = None,
 ) -> None:
-    """Re-spawn ssh for a dead slave with exponential backoff."""
+    """Re-spawn ssh for a dead slave with exponential backoff.
+
+    When ``launcher`` is passed, the block's title is updated to
+    ``<host> [reconnecting]`` during retry attempts and restored to
+    ``<host>`` on success — same visual feedback the original csshX
+    provided via its master-status line.
+    """
+    if launcher is not None:
+        await _set_title(launcher, slave, f"{slave.host} [reconnecting]")
+        await _set_color(launcher, slave)  # DEAD because slave.dead is True
     for attempt, delay in enumerate(_RECONNECT_BACKOFF, start=1):
         log.info("reconnect %s: attempt %d in %.1fs", slave.host, attempt, delay)
         await asyncio.sleep(delay)
@@ -254,6 +307,9 @@ async def _attempt_reconnect(
         except Exception as exc:
             log.warning("reconnect %s: bridge failed: %s", slave.host, exc)
             continue
+        if launcher is not None:
+            await _set_title(launcher, slave, slave.host)
+            await _set_color(launcher, slave)
         sys.stderr.write(f"\r[csshx-latest] {slave.host} reconnected\r\n")
         sys.stderr.flush()
         return
@@ -270,6 +326,7 @@ async def run_master(
     strict_preflight: bool = False,
     reconnect: bool = False,
     skip_preflight: bool = False,
+    command_key: bytes = KEY_COMMAND_PREFIX,
 ) -> int:
     """Top-level entry: spawn slaves, run the TUI, tear down on exit."""
     if len(hosts) > max_hosts:
@@ -297,15 +354,39 @@ async def run_master(
     winsize = _master_winsize()
     loop = asyncio.get_running_loop()
 
+    # Live re-paint on every toggle (Ctrl-T 1..9 / Ctrl-T b). The
+    # callback is fired from the TUI's event-loop thread, so a
+    # bare ``create_task`` is enough — no thread bridge needed.
+    def _on_state_change(s: Slave) -> None:
+        try:
+            loop.create_task(_set_color(launcher, s))
+        except RuntimeError:  # pragma: no cover - loop closed
+            pass
+
+    bcast.on_state_change = _on_state_change
+
     def on_slave_dead(s: Slave) -> None:
-        log.info("slave %d (%s) exited", s.index, s.host)
+        if s.user_closed:
+            log.info("slave %d (%s) exited (user closed block)", s.index, s.host)
+        else:
+            log.info("slave %d (%s) exited", s.index, s.host)
         try:
             render_status(bcast)
         except Exception:  # pragma: no cover - defensive
             pass
-        if reconnect:
+        # PTY reader runs on the loop thread, so this fires on the loop;
+        # schedule the repaint without threadsafe bridging.
+        try:
+            loop.create_task(_set_color(launcher, s))
+        except RuntimeError:  # pragma: no cover - loop closed
+            pass
+        # User-initiated close (via ``BYE`` on the control socket) must
+        # NOT trigger a reconnect — the user just told us this session
+        # is done. Without this guard, --reconnect would silently
+        # re-spawn ssh and the slave the user just closed would resurrect.
+        if _should_reconnect(s, reconnect):
             asyncio.run_coroutine_threadsafe(
-                _attempt_reconnect(s, ssh_args, login, winsize), loop
+                _attempt_reconnect(s, ssh_args, login, winsize, launcher), loop
             )
 
     await _start_launcher(launcher, len(hosts))
@@ -328,8 +409,11 @@ async def run_master(
             bcast.add(slave)
             attach = attach_command(slave.sock_path, slave.token_path)
             handle = await _open_block(launcher, attach, host)
+            slave.handle = handle
             handles.append(handle)
             await _tile(launcher, handles)
+            # Paint the initial ENABLED color now that we have a handle.
+            await _set_color(launcher, slave)
 
         await _tile(launcher, handles)
         await tui_loop(bcast)

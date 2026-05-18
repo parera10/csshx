@@ -86,13 +86,31 @@ def test_doubled_prefix_returns_literal_prefix_byte():
     assert not quit_ev.is_set()
 
 
-def test_unknown_byte_cancels_command_mode():
-    """An unmapped byte does nothing destructive — just cancels."""
+def test_unknown_printable_byte_cancels_and_echoes():
+    """Unmapped *printable* byte cancels command mode and echoes the byte.
+
+    Matches the original csshX behavior: a typo'd letter after Ctrl-T
+    isn't silently swallowed — command mode unwinds and the letter is
+    broadcast to the slaves.
+    """
     s1 = _make_slave(1, enabled=True)
     b = _bcast_with(s1)
     quit_ev = asyncio.Event()
 
     extra = asyncio.run(_handle_command_byte(b, ord("z"), quit_ev))
+
+    assert extra == b"z"
+    assert s1.enabled is True
+    assert not quit_ev.is_set()
+
+
+def test_unknown_control_byte_cancels_silently():
+    """A non-printable byte (Esc, Ctrl-C) cancels with no echo."""
+    s1 = _make_slave(1, enabled=True)
+    b = _bcast_with(s1)
+    quit_ev = asyncio.Event()
+
+    extra = asyncio.run(_handle_command_byte(b, 0x1B, quit_ev))  # Esc
 
     assert extra == b""
     assert s1.enabled is True

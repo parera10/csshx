@@ -2,12 +2,20 @@
 
 iTerm2's AppleScript bridge is fundamentally opaque from Python's side
 — the only thing we can really verify without an actual iTerm2 process
-is the *shape* of the AppleScript we send. Specifically, the v1.1
-powerlevel10k fix relies on running the attach command as the new
-session's ``command`` (which iTerm execvps directly) rather than via
-``write text`` (which types into the user's interactive shell, where
-p10k's instant-prompt can intercept keystrokes). These tests pin that
-contract.
+is the *shape* of the AppleScript we send.
+
+Two contracts pinned here:
+
+1. **The p10k fix:** every attach command is passed as the new
+   session's ``command`` (which iTerm execvps directly) rather than
+   via ``write text`` (which types into the user's interactive shell,
+   where p10k's instant-prompt can intercept keystrokes).
+
+2. **Master + slave co-tiling:** every block splits the master TUI's
+   current session. v1.0 created a brand-new window for the first
+   slave, leaving the master orphaned in its own window; iTerm2 only
+   rearranged the slaves. v1.1+ always splits, so iTerm2's automatic
+   pane balancing rearranges master and slaves together.
 """
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ import subprocess
 
 import pytest
 
+from csshx_latest.launcher import BlockHandle, Color
 from csshx_latest.launchers import iterm2 as iterm_mod
 
 
@@ -33,8 +42,14 @@ def fake_osascript(monkeypatch):
     return scripts
 
 
-def test_first_open_creates_window_with_command_not_write_text(fake_osascript):
-    """First block → ``create window with default profile command "<cmd>"``."""
+def test_first_open_splits_current_session_not_new_window(fake_osascript):
+    """First block → ``split vertically`` of the master's current session.
+
+    v1.0 issued ``create window with default profile`` here, which
+    parked the master TUI in a sibling window where iTerm2's auto-tile
+    couldn't reach it. v1.1+ splits the master's session so master +
+    every slave share one window and iTerm2 rearranges them together.
+    """
     l = iterm_mod.ITerm2Launcher()
     l.open_block(["socat", "-", "UNIX-CONNECT:/tmp/a"], "web01")
 
@@ -42,7 +57,8 @@ def test_first_open_creates_window_with_command_not_write_text(fake_osascript):
     s = fake_osascript[0]
     # The p10k fix: pass attach as the new session's ``command``,
     # not via ``write text`` (which types into the interactive shell).
-    assert "create window with default profile" in s
+    assert "split vertically with default profile" in s
+    assert "create window with default profile" not in s
     assert 'command "' in s
     assert "write text" not in s
     # Title is applied via ``set name`` on the new session.
@@ -51,18 +67,20 @@ def test_first_open_creates_window_with_command_not_write_text(fake_osascript):
     assert "socat" in s
 
 
-def test_second_open_uses_split_vertically_with_command(fake_osascript):
-    """Subsequent blocks split the current session, again via ``command``."""
+def test_second_open_also_uses_split_vertically_with_command(fake_osascript):
+    """Subsequent blocks also split the current session, again via ``command``."""
     l = iterm_mod.ITerm2Launcher()
     l.open_block(["echo", "first"], "first")
     l.open_block(["echo", "second"], "second")
 
     assert len(fake_osascript) == 2
-    s2 = fake_osascript[1]
-    assert "split vertically with default profile" in s2
-    assert 'command "' in s2
-    assert "write text" not in s2
-    assert 'set name to "second"' in s2
+    for body in fake_osascript:
+        assert "split vertically with default profile" in body
+        assert "create window with default profile" not in body
+        assert 'command "' in body
+        assert "write text" not in body
+    assert 'set name to "first"' in fake_osascript[0]
+    assert 'set name to "second"' in fake_osascript[1]
 
 
 def test_special_chars_in_attach_command_are_escaped(fake_osascript):
@@ -125,3 +143,56 @@ def test_set_title_renames_current_session(fake_osascript):
     assert len(fake_osascript) == 1
     assert "set name to" in fake_osascript[0]
     assert "renamed" in fake_osascript[0]
+
+
+def test_set_color_writes_session_background_per_state(fake_osascript):
+    """``set_color`` writes a per-state RGB triple to the matched session.
+
+    Exact RGB values come from :data:`_SESSION_BG`; we look them up
+    rather than hard-coding so a future palette retune only changes
+    one place. The contract pinned here is the AppleScript shape
+    (correct session id, ``background color`` write) and the one-to-
+    one mapping from Color state to palette entry.
+    """
+    l = iterm_mod.ITerm2Launcher()
+    h = BlockHandle(
+        backend="iterm2",
+        data={"title": "x", "window_id": "w1", "session_id": "sess-42"},
+    )
+    fake_osascript.clear()
+
+    l.set_color(h, Color.ENABLED)
+    l.set_color(h, Color.DISABLED)
+    l.set_color(h, Color.DEAD)
+
+    assert len(fake_osascript) == 3
+    # All three scripts target the captured session id and write
+    # ``background color`` (not a no-op anymore).
+    assert all('if id of s is "sess-42"' in s for s in fake_osascript)
+    assert all("set background color of s" in s for s in fake_osascript)
+    for script, color in zip(fake_osascript, (Color.ENABLED, Color.DISABLED, Color.DEAD)):
+        r, g, b = iterm_mod._SESSION_BG[color]
+        assert f"{{{r}, {g}, {b}}}" in script
+
+
+def test_session_bg_palette_is_distinct_and_in_range():
+    """All three Color states map to distinct, valid 16-bit RGB triples."""
+    palette = iterm_mod._SESSION_BG
+    assert set(palette.keys()) == {Color.ENABLED, Color.DISABLED, Color.DEAD}
+    triples = list(palette.values())
+    assert len(set(triples)) == 3
+    for r, g, b in triples:
+        assert 0 <= r <= 65535
+        assert 0 <= g <= 65535
+        assert 0 <= b <= 65535
+
+
+def test_set_color_is_noop_without_session_id(fake_osascript):
+    """No captured session_id → set_color silently no-ops."""
+    l = iterm_mod.ITerm2Launcher()
+    h = BlockHandle(backend="iterm2", data={"title": "x", "window_id": "w1"})
+    fake_osascript.clear()
+
+    l.set_color(h, Color.ENABLED)
+
+    assert fake_osascript == []

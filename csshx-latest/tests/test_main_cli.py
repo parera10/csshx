@@ -28,6 +28,7 @@ def captured_run(monkeypatch):
         strict_preflight=False,
         reconnect=False,
         skip_preflight=False,
+        command_key=b"\x14",
     ):
         captured["hosts"] = list(hosts)
         captured["ssh_args"] = list(ssh_args)
@@ -37,6 +38,7 @@ def captured_run(monkeypatch):
         captured["strict_preflight"] = strict_preflight
         captured["reconnect"] = reconnect
         captured["skip_preflight"] = skip_preflight
+        captured["command_key"] = command_key
         return 0
 
     monkeypatch.setattr(cli, "run_master", fake_coro)

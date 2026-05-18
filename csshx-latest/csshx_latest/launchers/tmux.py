@@ -25,12 +25,22 @@ import shlex
 import subprocess
 from typing import Optional
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
 
 #: Above this many hosts, open a dedicated tmux window rather than
 #: splitting the current pane. 4 is the largest count where a 2x2 split
 #: stays readable on a typical 1080p / 1440p display.
 PANE_THRESHOLD = 4
+
+#: 256-color codes for per-pane border / background paint.
+#: Mirrors the original csshX's "subtle dark tint" palette: dark green
+#: for enabled, neutral grey for disabled, dark red for dead. These
+#: stay readable against any reasonable terminal theme.
+_COLOR_BG: dict[Color, str] = {
+    Color.ENABLED: "colour22",   # dark green
+    Color.DISABLED: "colour237", # dark grey
+    Color.DEAD: "colour52",      # dark red
+}
 
 
 class TmuxLauncher:
@@ -107,3 +117,19 @@ class TmuxLauncher:
         if not pane_id:
             return
         self._run(["tmux", "select-pane", "-t", pane_id, "-T", title])
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """Tint the pane border + status to reflect broadcast state.
+
+        Uses ``tmux select-pane -P bg=<colour>``, which paints the pane
+        body's "padding" / border tint without touching the remote
+        shell's ANSI state. The original csshX painted the AppKit
+        window title bar; we do the closest tmux equivalent.
+        """
+        pane_id = handle.data.get("pane_id")
+        if not pane_id:
+            return
+        bg = _COLOR_BG.get(color)
+        if not bg:
+            return
+        self._run(["tmux", "select-pane", "-t", pane_id, "-P", f"bg={bg}"])

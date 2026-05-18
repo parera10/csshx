@@ -13,11 +13,13 @@ import sys
 from importlib import metadata
 from typing import Optional
 
+from csshx_latest.action import DEFAULT_TIMEOUT as ACTION_TIMEOUT, run_action
 from csshx_latest.config import load_clusters
 from csshx_latest.hosts import expand_hosts
 from csshx_latest.launcher import available_launcher_names, detect_launcher
 from csshx_latest.logging_setup import configure_logging
 from csshx_latest.orchestrator import DEFAULT_MAX_HOSTS, run_master
+from csshx_latest.tui import parse_command_key
 
 
 def _version() -> str:
@@ -77,6 +79,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Re-spawn ssh with exponential backoff when a slave's connection drops.",
     )
     parser.add_argument(
+        "--action",
+        default=None,
+        help=(
+            "One-shot mode: run the given command via ssh on every host "
+            "concurrently, print a per-host summary, and exit (no TUI). "
+            "Equivalent to csshX's --remote_command."
+        ),
+    )
+    parser.add_argument(
+        "--action-timeout",
+        type=float,
+        default=ACTION_TIMEOUT,
+        help=f"Per-host ssh timeout in --action mode (default: {ACTION_TIMEOUT}s).",
+    )
+    parser.add_argument(
+        "--command-key",
+        default="^T",
+        help=(
+            "Master command-mode prefix. Accepts ^X (Ctrl-X), ^A, ... "
+            "or a raw byte like 0x14. Default: ^T."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Verbose logging to stderr.",
@@ -98,8 +123,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not expanded:
         parser.error("no hosts after brace / cluster expansion")
 
-    launcher = detect_launcher(args.launcher)
     ssh_extra = _shlex.split(args.ssh_args) if args.ssh_args else []
+
+    if args.action:
+        # One-shot mode bypasses the TUI / launcher entirely.
+        try:
+            return asyncio.run(
+                run_action(
+                    expanded,
+                    ssh_extra,
+                    args.login,
+                    args.action,
+                    timeout=args.action_timeout,
+                )
+            )
+        except KeyboardInterrupt:
+            return 130
+
+    try:
+        command_key = parse_command_key(args.command_key)
+    except ValueError as exc:
+        parser.error(f"invalid --command-key: {exc}")
+
+    launcher = detect_launcher(args.launcher)
 
     try:
         return asyncio.run(
@@ -112,6 +158,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 strict_preflight=args.strict,
                 reconnect=args.reconnect,
                 skip_preflight=args.no_preflight,
+                command_key=command_key,
             )
         )
     except KeyboardInterrupt:
