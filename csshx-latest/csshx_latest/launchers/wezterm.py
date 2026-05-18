@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import subprocess
 
-from csshx_latest.launcher import BlockHandle
+from csshx_latest.launcher import BlockHandle, Color
 
 
 class WezTermLauncher:
@@ -14,6 +14,9 @@ class WezTermLauncher:
     @staticmethod
     def _run(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
         return subprocess.run(args, check=False, capture_output=capture, text=True)
+
+    def start(self, total: int) -> None:
+        """No-op: WezTerm balances panes automatically."""
 
     def open_block(self, attach_cmd: list[str], title: str) -> BlockHandle:
         """Spawn a new pane and stamp the tab title with ``host``."""
@@ -39,3 +42,6 @@ class WezTermLauncher:
         if not pane_id:
             return
         self._run(["wezterm", "cli", "set-tab-title", "--pane-id", pane_id, title])
+
+    def set_color(self, handle: BlockHandle, color: Color) -> None:
+        """WezTerm has no CLI hook for per-pane background tint."""

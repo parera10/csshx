@@ -67,13 +67,17 @@ def harmless_pid():
 
 
 @pytest.fixture
-def stdio_devnull(monkeypatch):
+def stdio_devnull(monkeypatch, capsys):
     """Replace ``sys.stdin``/``sys.stdout`` with real fds on ``os.devnull``.
 
     Required by tests that call ``attach.main()`` because pytest's
     ``capsys`` capture leaves ``sys.stdin``/``sys.stdout`` without a usable
     ``.fileno()``. ``sys.stderr`` is left untouched so ``capsys`` still
     captures the error messages we assert on.
+
+    The ``capsys`` dependency forces pytest to set up its capture wrappers
+    *before* this fixture monkey-patches sys.stdin/sys.stdout — otherwise
+    capsys overrides our devnull file objects and ``.fileno()`` blows up.
     """
     fin = open(os.devnull, "rb")
     fout = open(os.devnull, "wb")
